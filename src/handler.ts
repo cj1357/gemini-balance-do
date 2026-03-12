@@ -226,13 +226,18 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 			}
 		}
 
-		switch (true) {
-			case model.endsWith(':search'):
-				model = model.substring(0, model.length - 7);
-			case req.model.endsWith('-search-preview'):
-			case req.tools?.some((tool: any) => tool.function?.name === 'googleSearch'):
-				body.tools = body.tools || [];
-				body.tools.push({ function_declarations: [{ name: 'googleSearch', parameters: {} }] });
+		let hasGoogleSearch = false;
+		if (model.endsWith(':search')) {
+			model = model.substring(0, model.length - 7);
+			hasGoogleSearch = true;
+		}
+		if (req.model?.endsWith('-search-preview') || req.tools?.some((tool: any) => tool.function?.name === 'googleSearch')) {
+			hasGoogleSearch = true;
+		}
+
+		if (hasGoogleSearch) {
+			body.tools = body.tools || [];
+			body.tools.push({ googleSearch: {} } as any);
 		}
 
 		const TASK = req.stream ? 'streamGenerateContent' : 'generateContent';
@@ -365,6 +370,9 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 			temperature: 'temperature',
 			top_k: 'topK',
 			top_p: 'topP',
+			response_modalities: 'responseModalities',
+			image_config: 'imageConfig',
+			thinking_config: 'thinkingConfig',
 		};
 
 		const thinkingBudgetMap: Record<string, number> = {
@@ -378,6 +386,8 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 			const matchedKey = fieldsMap[key];
 			if (matchedKey) {
 				cfg[matchedKey] = req[key];
+			} else if (key === 'responseModalities' || key === 'imageConfig' || key === 'thinkingConfig') {
+				cfg[key] = req[key];
 			}
 		}
 
@@ -399,8 +409,13 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 					throw new HttpError('Unsupported response_format.type', 400);
 			}
 		}
-		if (req.reasoning_effort) {
-			cfg.thinkingConfig = { thinkingBudget: thinkingBudgetMap[req.reasoning_effort] };
+		if (!cfg.thinkingConfig && req.reasoning_effort) {
+			const effort = req.reasoning_effort.toLowerCase();
+			if (req.model && (req.model.includes('gemini-3') || req.model.includes('gemini-2.5-pro'))) {
+				cfg.thinkingConfig = { thinkingLevel: effort.toUpperCase() };
+			} else {
+				cfg.thinkingConfig = { thinkingBudget: thinkingBudgetMap[effort] || 8192 };
+			}
 		}
 
 		return cfg;
