@@ -73,37 +73,23 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 			return new Response('', { status: 204 });
 		}
 
+		let apiKey = '';
 		const search = url.search;
-		const authKey = env.AUTH_KEY;
-		const apiKey = env.API_KEY;
-
-		// 传统模式：验证 AUTH_KEY
-		if (authKey) {
-			let isAuthorized = false;
-			// Check key in query parameters
-			if (search.includes('key=')) {
-				const requestKey = url.searchParams.get('key');
-				if (requestKey && requestKey === authKey) {
-					isAuthorized = true;
-				}
-			} else {
-				// Check Authorization header or x-goog-api-key
-				const requestKey = request.headers.get('x-goog-api-key');
-				const authHeader = request.headers.get('Authorization');
-				if (requestKey && requestKey === authKey) {
-					isAuthorized = true;
-				} else if (authHeader && authHeader.replace(/^Bearer\s+/, '') === authKey) {
-					isAuthorized = true;
-				}
-			}
-
-			if (!isAuthorized) {
-				return new Response('Unauthorized', { status: 401, headers: fixCors({}).headers });
+		
+		if (search.includes('key=')) {
+			apiKey = url.searchParams.get('key') || '';
+		} else {
+			const requestKey = request.headers.get('x-goog-api-key');
+			const authHeader = request.headers.get('Authorization');
+			if (requestKey) {
+				apiKey = requestKey;
+			} else if (authHeader && authHeader.startsWith('Bearer ')) {
+				apiKey = authHeader.replace(/^Bearer\s+/, '');
 			}
 		}
 
 		if (!apiKey) {
-			return new Response('API_KEY is missing in environment variables', { status: 500, headers: fixCors({}).headers });
+			return new Response('No API key found in the client request. Please check your query parameters or headers.', { status: 400, headers: fixCors({}).headers });
 		}
 
 		// OpenAI compatible routes
