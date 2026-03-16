@@ -66,6 +66,18 @@ function createTimeoutSignal(timeoutMs: number) {
 	};
 }
 
+async function fetchWithTimeout(targetUrl: string, init: RequestInit, timeoutMs: number) {
+	const timeout = createTimeoutSignal(timeoutMs);
+	try {
+		return await fetch(targetUrl, {
+			...init,
+			signal: timeout.signal,
+		});
+	} finally {
+		timeout.clear();
+	}
+}
+
 async function fetchWithRetryAndFallback(
 	pathAndSearch: string,
 	init: RequestInit,
@@ -90,15 +102,16 @@ async function fetchWithRetryAndFallback(
 					return res;
 				}
 
+				if (attempt === maxAttemptsPerHost && host === hosts[hosts.length - 1]) {
+					timeout.clear();
+					return res;
+				}
+
 				console.warn(
 					`[${requestId}] retryable status ${res.status}, attempt ${attempt}/${maxAttemptsPerHost}, host=${host}`
 				);
 				res.body?.cancel();
 				timeout.clear();
-
-				if (attempt === maxAttemptsPerHost && host === hosts[hosts.length - 1]) {
-					return res;
-				}
 			} catch (err) {
 				lastError = err;
 				timeout.clear();
@@ -125,18 +138,14 @@ async function fetchWithRetryAndFallback(
 	async function forwardRequest(targetUrl: string, request: Request, headers: Headers, apiKey: string, env: Env): Promise<Response> {
 		const requestId = generateId();
 		console.log(`[${requestId}] Request Sending to Vertex AI: ${sanitizeUrl(targetUrl)}`);
-		const target = new URL(targetUrl);
-		const body = request.method === 'GET' || request.method === 'HEAD' ? null : await request.arrayBuffer();
-		const response = await fetchWithRetryAndFallback(
-			`${target.pathname}${target.search}`,
+		const response = await fetchWithTimeout(
+			targetUrl,
 			{
 				method: request.method,
 				headers,
-				body,
+				body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
 			},
-			requestId,
-			getUpstreamTimeoutMs(env),
-			1
+			getUpstreamTimeoutMs(env)
 		);
 
 		if (response.status === 429) {
