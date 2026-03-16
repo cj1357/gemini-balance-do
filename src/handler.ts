@@ -18,8 +18,12 @@ const fixCors = ({ headers, status, statusText }: { headers?: HeadersInit; statu
 };
 
 const BASE_URL = 'https://aiplatform.googleapis.com';
+const BASE_URL_FALLBACK = 'https://us-central1-aiplatform.googleapis.com';
 const API_VERSION = 'v1/publishers/google';
 const API_CLIENT = 'genai-js/0.21.0';
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 100_000;
+const MAX_UPSTREAM_TIMEOUT_MS = 110_000;
+const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
 const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 	'x-goog-api-client': API_CLIENT,
@@ -27,21 +31,119 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 	...more,
 });
 
+const maskKey = (key: string) => {
+	if (!key) return '';
+	if (key.length <= 8) return '****';
+	return `${key.slice(0, 4)}****${key.slice(-4)}`;
+};
 
-	async function forwardRequest(targetUrl: string, request: Request, headers: Headers, apiKey: string): Promise<Response> {
-		console.log(`Request Sending to Vertex AI: ${targetUrl}`);
+const sanitizeUrl = (raw: string) => {
+	try {
+		const u = new URL(raw);
+		if (u.searchParams.has('key')) {
+			u.searchParams.set('key', '***');
+		}
+		return u.toString();
+	} catch {
+		return raw;
+	}
+};
 
-		const response = await fetch(targetUrl, {
-			method: request.method,
-			headers: headers,
-			body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
-		});
+function getUpstreamTimeoutMs(env: Env) {
+	const raw = Number(env.UPSTREAM_TIMEOUT_MS);
+	if (!Number.isFinite(raw)) {
+		return DEFAULT_UPSTREAM_TIMEOUT_MS;
+	}
+	return Math.max(1_000, Math.min(MAX_UPSTREAM_TIMEOUT_MS, Math.floor(raw)));
+}
+
+function createTimeoutSignal(timeoutMs: number) {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(new Error(`upstream timeout(${timeoutMs}ms)`)), timeoutMs);
+	return {
+		signal: controller.signal,
+		clear: () => clearTimeout(timer),
+	};
+}
+
+async function fetchWithRetryAndFallback(
+	pathAndSearch: string,
+	init: RequestInit,
+	requestId: string,
+	timeoutMs: number,
+	maxAttemptsPerHost = 2
+): Promise<Response> {
+	const hosts = [BASE_URL, BASE_URL_FALLBACK];
+	let lastError: unknown;
+
+	for (const host of hosts) {
+		for (let attempt = 1; attempt <= maxAttemptsPerHost; attempt++) {
+			const timeout = createTimeoutSignal(timeoutMs);
+			try {
+				const res = await fetch(`${host}${pathAndSearch}`, {
+					...init,
+					signal: timeout.signal,
+				});
+
+				if (!RETRYABLE_STATUS.has(res.status)) {
+					timeout.clear();
+					return res;
+				}
+
+				console.warn(
+					`[${requestId}] retryable status ${res.status}, attempt ${attempt}/${maxAttemptsPerHost}, host=${host}`
+				);
+				res.body?.cancel();
+				timeout.clear();
+
+				if (attempt === maxAttemptsPerHost && host === hosts[hosts.length - 1]) {
+					return res;
+				}
+			} catch (err) {
+				lastError = err;
+				timeout.clear();
+				const message = err instanceof Error ? err.message : String(err);
+				console.warn(
+					`[${requestId}] upstream fetch failed, attempt ${attempt}/${maxAttemptsPerHost}, host=${host}, error=${message}`
+				);
+				if (attempt === maxAttemptsPerHost && host === hosts[hosts.length - 1]) {
+					break;
+				}
+			}
+		}
+	}
+
+	throw new HttpError(
+		`Upstream Vertex timeout or unavailable. request_id=${requestId}. Last error: ${
+			lastError instanceof Error ? lastError.message : 'unknown'
+		}`,
+		504
+	);
+}
+
+
+	async function forwardRequest(targetUrl: string, request: Request, headers: Headers, apiKey: string, env: Env): Promise<Response> {
+		const requestId = generateId();
+		console.log(`[${requestId}] Request Sending to Vertex AI: ${sanitizeUrl(targetUrl)}`);
+		const target = new URL(targetUrl);
+		const body = request.method === 'GET' || request.method === 'HEAD' ? null : await request.arrayBuffer();
+		const response = await fetchWithRetryAndFallback(
+			`${target.pathname}${target.search}`,
+			{
+				method: request.method,
+				headers,
+				body,
+			},
+			requestId,
+			getUpstreamTimeoutMs(env),
+			1
+		);
 
 		if (response.status === 429) {
-			console.log(`API key ${apiKey} received 429 status code.`);
+			console.log(`[${requestId}] API key ${maskKey(apiKey)} received 429 status code.`);
 		}
 
-		console.log('Call Vertex AI Success');
+		console.log(`[${requestId}] Call Vertex AI Success`);
 
 		const responseHeaders = new Headers(response.headers);
 		responseHeaders.set('Access-Control-Allow-Origin', '*');
@@ -58,69 +160,80 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 	}
 
 	export async function handleProxy(request: Request, env: Env): Promise<Response> {
-		if (request.method === 'OPTIONS') {
-			return new Response(null, {
-				status: 204,
+		try {
+			if (request.method === 'OPTIONS') {
+				return new Response(null, {
+					status: 204,
+					headers: fixCors({}).headers,
+				});
+			}
+
+			const url = new URL(request.url);
+			const pathname = url.pathname;
+
+			// 静态资源直接放行
+			if (pathname === '/favicon.ico' || pathname === '/robots.txt') {
+				return new Response('', { status: 204 });
+			}
+
+			let apiKey = '';
+			const search = url.search;
+			
+			if (search.includes('key=')) {
+				apiKey = url.searchParams.get('key') || '';
+			} else {
+				const requestKey = request.headers.get('x-goog-api-key');
+				const authHeader = request.headers.get('Authorization');
+				if (requestKey) {
+					apiKey = requestKey;
+				} else if (authHeader && authHeader.startsWith('Bearer ')) {
+					apiKey = authHeader.replace(/^Bearer\s+/, '');
+				}
+			}
+
+			if (!apiKey) {
+				return new Response('No API key found in the client request. Please check your query parameters or headers.', { status: 400, headers: fixCors({}).headers });
+			}
+
+			// OpenAI compatible routes
+			if (
+				pathname.endsWith('/chat/completions') ||
+				pathname.endsWith('/completions') ||
+				pathname.endsWith('/embeddings') ||
+				pathname.endsWith('/v1/models')
+			) {
+				return handleOpenAI(request, apiKey, env);
+			}
+
+			// Direct Proxy to Vertex AI
+			let targetUrl = `${BASE_URL}${pathname}${search}`;
+			const targetUrlObj = new URL(targetUrl);
+			targetUrlObj.searchParams.set('key', apiKey);
+			
+			let headers = new Headers();
+			if (request.headers.has('content-type')) {
+				headers.set('content-type', request.headers.get('content-type')!);
+			}
+			headers.set('x-goog-api-key', apiKey);
+
+			return forwardRequest(targetUrlObj.toString(), request, headers, apiKey, env);
+		} catch (err) {
+			const isHttpError = err instanceof HttpError;
+			const status = isHttpError ? err.status : 500;
+			const message = err instanceof Error ? err.message : 'Internal Server Error';
+			console.error(`Proxy request failed: ${message}`);
+			return new Response(message, {
+				status,
 				headers: fixCors({}).headers,
 			});
 		}
-
-		const url = new URL(request.url);
-		const pathname = url.pathname;
-
-		// 静态资源直接放行
-		if (pathname === '/favicon.ico' || pathname === '/robots.txt') {
-			return new Response('', { status: 204 });
-		}
-
-		let apiKey = '';
-		const search = url.search;
-		
-		if (search.includes('key=')) {
-			apiKey = url.searchParams.get('key') || '';
-		} else {
-			const requestKey = request.headers.get('x-goog-api-key');
-			const authHeader = request.headers.get('Authorization');
-			if (requestKey) {
-				apiKey = requestKey;
-			} else if (authHeader && authHeader.startsWith('Bearer ')) {
-				apiKey = authHeader.replace(/^Bearer\s+/, '');
-			}
-		}
-
-		if (!apiKey) {
-			return new Response('No API key found in the client request. Please check your query parameters or headers.', { status: 400, headers: fixCors({}).headers });
-		}
-
-		// OpenAI compatible routes
-		if (
-			pathname.endsWith('/chat/completions') ||
-			pathname.endsWith('/completions') ||
-			pathname.endsWith('/embeddings') ||
-			pathname.endsWith('/v1/models')
-		) {
-			return handleOpenAI(request, apiKey);
-		}
-
-		// Direct Proxy to Vertex AI
-		let targetUrl = `${BASE_URL}${pathname}${search}`;
-		const targetUrlObj = new URL(targetUrl);
-		targetUrlObj.searchParams.set('key', apiKey);
-		
-		let headers = new Headers();
-		if (request.headers.has('content-type')) {
-			headers.set('content-type', request.headers.get('content-type')!);
-		}
-		headers.set('x-goog-api-key', apiKey);
-
-		return forwardRequest(targetUrlObj.toString(), request, headers, apiKey);
 	}
 
 
-	async function handleModels(apiKey: string) {
-		const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
+	async function handleModels(apiKey: string, env: Env) {
+		const response = await fetchWithRetryAndFallback(`/${API_VERSION}/models`, {
 			headers: makeHeaders(apiKey),
-		});
+		}, generateId(), getUpstreamTimeoutMs(env));
 
 		let responseBody: BodyInit | null = response.body;
 		if (response.ok) {
@@ -142,7 +255,7 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 		return new Response(responseBody, fixCors(response));
 	}
 
-	async function handleEmbeddings(req: any, apiKey: string) {
+	async function handleEmbeddings(req: any, apiKey: string, env: Env) {
 		const DEFAULT_EMBEDDINGS_MODEL = 'text-embedding-004';
 
 		if (typeof req.model !== 'string') {
@@ -163,7 +276,7 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 			req.input = [req.input];
 		}
 
-		const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
+		const response = await fetchWithRetryAndFallback(`/${API_VERSION}/${model}:batchEmbedContents`, {
 			method: 'POST',
 			headers: makeHeaders(apiKey, { 'Content-Type': 'application/json' }),
 			body: JSON.stringify({
@@ -173,7 +286,7 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 					outputDimensionality: req.dimensions,
 				})),
 			}),
-		});
+		}, generateId(), getUpstreamTimeoutMs(env));
 
 		let responseBody: BodyInit | null = response.body;
 		if (response.ok) {
@@ -195,7 +308,7 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 		return new Response(responseBody, fixCors(response));
 	}
 
-	async function handleCompletions(req: any, apiKey: string) {
+	async function handleCompletions(req: any, apiKey: string, env: Env) {
 		const DEFAULT_MODEL = 'gemini-2.5-flash';
 		let model = DEFAULT_MODEL;
 
@@ -246,11 +359,12 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 			url += '?alt=sse';
 		}
 
-		const response = await fetch(url, {
+		const parsed = new URL(url);
+		const response = await fetchWithRetryAndFallback(`${parsed.pathname}${parsed.search}`, {
 			method: 'POST',
 			headers: makeHeaders(apiKey, { 'Content-Type': 'application/json' }),
 			body: JSON.stringify(body),
-		});
+		}, generateId(), getUpstreamTimeoutMs(env));
 
 		let responseBody: BodyInit | null = response.body;
 		if (response.ok) {
@@ -301,7 +415,7 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 		return new Response(responseBody, fixCors(response));
 	}
 
-	async function handleOpenAI(request: Request, apiKey: string) {
+	async function handleOpenAI(request: Request, apiKey: string, env: Env) {
 		const url = new URL(request.url);
 		const pathname = url.pathname;
         
@@ -310,7 +424,7 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 		}
 
 		if (pathname === '/v1/models') {
-			return handleModels(apiKey);
+			return handleModels(apiKey, env);
 		}
 
 		let req;
@@ -321,9 +435,9 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 		}
 		
 		if (pathname.endsWith('/embeddings')) {
-			return handleEmbeddings(req, apiKey);
+			return handleEmbeddings(req, apiKey, env);
 		} else if (pathname.endsWith('/completions') || pathname.endsWith('/chat/completions')) {
-			return handleCompletions(req, apiKey);
+			return handleCompletions(req, apiKey, env);
 		}
 		return new Response('Unknown OpenAI Endpoint', { status: 404, headers: fixCors({}).headers });
 	}

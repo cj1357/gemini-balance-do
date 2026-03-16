@@ -4,6 +4,7 @@ import { handleProxy } from './handler';
 export type Env = {
 	AUTH_KEY: string;
 	API_KEY: string;
+	UPSTREAM_TIMEOUT_MS?: string;
 };
 
 const app = new Hono<{ Bindings: Env }>();
