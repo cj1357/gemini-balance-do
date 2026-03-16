@@ -21,7 +21,7 @@ const BASE_URL = 'https://aiplatform.googleapis.com';
 const BASE_URL_FALLBACK = 'https://us-central1-aiplatform.googleapis.com';
 const API_VERSION = 'v1/publishers/google';
 const API_CLIENT = 'genai-js/0.21.0';
-const DEFAULT_UPSTREAM_TIMEOUT_MS = 100_000;
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 110_000;
 const MAX_UPSTREAM_TIMEOUT_MS = 110_000;
 const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
@@ -73,6 +73,12 @@ async function fetchWithTimeout(targetUrl: string, init: RequestInit, timeoutMs:
 			...init,
 			signal: timeout.signal,
 		});
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		if (message.includes('upstream timeout')) {
+			throw new HttpError(message, 504);
+		}
+		throw err;
 	} finally {
 		timeout.clear();
 	}
