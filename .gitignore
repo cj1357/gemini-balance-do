@@ -165,3 +165,7 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+gemini_image_*.png
+test-image.ps1
+test-api.ps1
