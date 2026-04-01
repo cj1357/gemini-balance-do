@@ -4,16 +4,14 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "vertex-ai-proxy",
+	"name": "openrouter-proxy",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-08-05",
-	"keep_vars": true,//部署时保留 Cloudflare 控制台中设置的变量值，不被 vars 字段覆盖
+	"keep_vars": true,
 	"observability": {
 		"enabled": true
 	},
 	"vars": {
-		"AUTH_KEY": "ajielu",
-		"API_KEY": "your_vertex_ai_api_key_here",
 		"UPSTREAM_TIMEOUT_MS": "110000"
 	}
 }
