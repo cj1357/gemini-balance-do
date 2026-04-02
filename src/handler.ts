@@ -36,7 +36,21 @@ export async function handleProxy(request: Request, env: Env): Promise<Response>
 		const headers = new Headers(request.headers);
 		// Remove Host so OpenRouter doesn't reject it
 		headers.delete('Host');
-		
+        
+		// Remove headers that expose the client's real IP and region, 
+		// to fully bypass regional restrictions via the proxy
+		const headersToRemove = [
+			'x-forwarded-for',
+			'x-forwarded-proto',
+			'x-real-ip',
+			'cf-connecting-ip',
+			'cf-ipcountry',
+			'cf-ray',
+			'cf-visitor',
+			'true-client-ip'
+		];
+		headersToRemove.forEach(h => headers.delete(h));
+
 		// If client passed key via url param, move it to authorization header so OpenRouter sees it
 		if (url.searchParams.has('key')) {
 			const key = url.searchParams.get('key');
